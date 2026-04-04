@@ -7,7 +7,7 @@ from io import BytesIO
 # PAGE CONFIG
 # ==========================================
 st.set_page_config(
-    page_title="Deposit vs Debit Reconciliation Tool",
+    page_title="Bank Reconciliation Tool",
     page_icon="💰",
     layout="wide"
 )
@@ -102,10 +102,10 @@ st.markdown("""
 # ==========================================
 st.markdown("""
 <div class="hero-card">
-    <div class="hero-title">💰 Deposit vs Debit Reconciliation Tool</div>
+    <div class="hero-title">💰 Smart Bank Reconciliation Tool</div>
     <div class="hero-subtitle">
-        Upload your bank Excel file, auto-detect format, compare Deposit vs Debit entries,
-        and generate a professional mismatch report instantly.
+        Upload your Excel file, auto-detect headers and columns, compare transactions,
+        and generate a professional mismatch report with row-level references.
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -116,20 +116,21 @@ st.markdown("""
 with st.sidebar:
     st.markdown("## ⚙️ How to Use")
     st.write("1. Upload the Excel file")
-    st.write("2. Tool auto-detects format")
-    st.write("3. Review summary, mismatches, and row references")
-    st.write("4. Download report")
+    st.write("2. Choose comparison mode")
+    st.write("3. Review dashboard and mismatches")
+    st.write("4. Download CSV or Excel report")
 
     st.markdown("---")
-    st.markdown("## ✅ Features")
+    st.markdown("## ✅ Supported Modes")
+    st.write("- Deposit vs Debit")
+    st.write("- Withdrawal vs Credit")
+
+    st.markdown("---")
+    st.markdown("## ✅ Smart Features")
     st.write("- Auto header detection")
-    st.write("- Smart column detection")
-    st.write("- Dashboard metrics")
-    st.write("- Row-level mismatch references")
-    st.write("- CSV & Excel export")
-
-    st.markdown("---")
-    st.info("Tip: 'Mismatch Groups' means how many different amount values have mismatches. 'Total Missing Entries' means the actual unmatched row count.")
+    st.write("- Flexible column matching")
+    st.write("- Row-level mismatch tracing")
+    st.write("- CSV and Excel export")
 
 # ==========================================
 # HELPERS
@@ -140,56 +141,57 @@ def clean_columns(df):
     df.columns = df.columns.str.replace(r"\s+", " ", regex=True)
     return df
 
-def read_sheet2_correctly(file_bytes):
-    """
-    Try different header rows for Sheet2 and return the first one
-    where a debit-like column is found.
-    """
-    for i in range(6):
-        try:
-            temp = pd.read_excel(BytesIO(file_bytes), sheet_name="Sheet2", header=i)
-            temp = clean_columns(temp)
-            cols = [str(c).lower() for c in temp.columns]
+def normalize_name(name):
+    return (
+        str(name)
+        .strip()
+        .lower()
+        .replace("\n", " ")
+        .replace(" ", "")
+        .replace("_", "")
+    )
 
-            if any(("debit" in c) or ("withdraw" in c) for c in cols):
-                return temp, i
+def find_matching_column(columns, aliases):
+    normalized_map = {normalize_name(col): col for col in columns}
+    for alias in aliases:
+        alias_norm = normalize_name(alias)
+        if alias_norm in normalized_map:
+            return normalized_map[alias_norm]
+
+    # fallback: partial match
+    for col in columns:
+        col_norm = normalize_name(col)
+        for alias in aliases:
+            alias_norm = normalize_name(alias)
+            if alias_norm in col_norm or col_norm in alias_norm:
+                return col
+    return None
+
+def read_sheet_with_header_detection(file_bytes, sheet_name, aliases_to_find, max_header_rows=12):
+    for header_row in range(max_header_rows):
+        try:
+            temp_df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=header_row)
+            temp_df = clean_columns(temp_df)
+
+            found_any = False
+            for alias_group in aliases_to_find:
+                match = find_matching_column(temp_df.columns, alias_group)
+                if match is not None:
+                    found_any = True
+                    break
+
+            if found_any:
+                return temp_df, header_row
         except Exception:
             continue
 
     return None, None
 
-def find_deposit_col(cols):
-    possible_cols = [
-        "Deposit Amt (INR)",
-        "Deposit Amount (INR)",
-        "Deposit Amt",
-        "Deposit Amount",
-        "Deposit"
-    ]
-    for c in possible_cols:
-        if c in cols:
-            return c
-    return None
-
-def find_debit_col(cols):
-    possible_cols = [
-        "Debit (LC)",
-        "Debit(LC)",
-        "Debit",
-        "Debit LC",
-        "Debit Amount",
-        "Withdrawal Amount",
-        "Withdrawals"
-    ]
-    for c in possible_cols:
-        if c in cols:
-            return c
-    return None
-
 def clean_numeric(series):
     return pd.to_numeric(
         series.astype(str)
         .str.replace(",", "", regex=False)
+        .str.replace("₹", "", regex=False)
         .str.strip(),
         errors="coerce"
     ).fillna(0)
@@ -202,126 +204,173 @@ def to_excel(df):
     return output.getvalue()
 
 # ==========================================
-# FILE UPLOAD
+# COLUMN ALIASES
+# ==========================================
+DEPOSIT_ALIASES = [
+    "Deposit Amt (INR)",
+    "Deposit Amount (INR)",
+    "Deposit Amt",
+    "Deposit Amount",
+    "Deposit"
+]
+
+WITHDRAWAL_ALIASES = [
+    "Withdrawal Amt (INR)",
+    "Withdrawal Amount (INR)",
+    "Withdrawal Amt",
+    "Withdrawal Amount",
+    "Withdrawal",
+    "Withdrawals"
+]
+
+DEBIT_ALIASES = [
+    "Debit (LC)",
+    "Debit(LC)",
+    "Debit LC",
+    "Debit Amount",
+    "Debit"
+]
+
+CREDIT_ALIASES = [
+    "Credit (LC)",
+    "Credit(LC)",
+    "Credit LC",
+    "Credit Amount",
+    "Credit"
+]
+
+# ==========================================
+# FILE UPLOAD + MODE
 # ==========================================
 st.markdown('<div class="info-card"><div class="section-title">📤 Upload File</div></div>', unsafe_allow_html=True)
 
 uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
 
+comparison_mode = st.selectbox(
+    "Select Comparison Type",
+    ["Deposit vs Debit", "Withdrawal vs Credit"]
+)
+
 if uploaded_file:
     try:
         file_bytes = uploaded_file.read()
 
-        # ==========================================
-        # READ SHEETS
-        # ==========================================
-        sheet1 = pd.read_excel(BytesIO(file_bytes), sheet_name="Sheet1", header=16)
-        sheet1 = clean_columns(sheet1)
+        # Read both sheets with flexible header detection
+        sheet1, sheet1_header = read_sheet_with_header_detection(
+            file_bytes=file_bytes,
+            sheet_name="Sheet1",
+            aliases_to_find=[DEPOSIT_ALIASES, WITHDRAWAL_ALIASES],
+            max_header_rows=25
+        )
 
-        sheet2, header_row = read_sheet2_correctly(file_bytes)
+        sheet2, sheet2_header = read_sheet_with_header_detection(
+            file_bytes=file_bytes,
+            sheet_name="Sheet2",
+            aliases_to_find=[DEBIT_ALIASES, CREDIT_ALIASES],
+            max_header_rows=12
+        )
+
+        if sheet1 is None:
+            st.error("❌ Could not detect the correct header row in Sheet1.")
+            st.stop()
 
         if sheet2 is None:
             st.error("❌ Could not detect the correct header row in Sheet2.")
             st.stop()
 
-        # ==========================================
-        # DETECT REQUIRED COLUMNS
-        # ==========================================
-        deposit_col = find_deposit_col(sheet1.columns)
-        debit_col = find_debit_col(sheet2.columns)
+        # Choose columns by mode
+        if comparison_mode == "Deposit vs Debit":
+            left_label = "Deposit"
+            right_label = "Debit"
+            left_aliases = DEPOSIT_ALIASES
+            right_aliases = DEBIT_ALIASES
+        else:
+            left_label = "Withdrawal"
+            right_label = "Credit"
+            left_aliases = WITHDRAWAL_ALIASES
+            right_aliases = CREDIT_ALIASES
 
-        if deposit_col is None:
-            st.error("❌ Deposit column not found in Sheet1.")
+        left_col = find_matching_column(sheet1.columns, left_aliases)
+        right_col = find_matching_column(sheet2.columns, right_aliases)
+
+        if left_col is None:
+            st.error(f"❌ {left_label} column not found in Sheet1.")
             st.write("Available Sheet1 columns:", list(sheet1.columns))
             st.stop()
 
-        if debit_col is None:
-            st.error("❌ Debit column not found in Sheet2.")
+        if right_col is None:
+            st.error(f"❌ {right_label} column not found in Sheet2.")
             st.write("Available Sheet2 columns:", list(sheet2.columns))
             st.stop()
 
-        # ==========================================
-        # CLEAN DATA
-        # ==========================================
-        sheet1[deposit_col] = clean_numeric(sheet1[deposit_col])
-        sheet2[debit_col] = clean_numeric(sheet2[debit_col])
+        # Clean numeric columns
+        sheet1[left_col] = clean_numeric(sheet1[left_col])
+        sheet2[right_col] = clean_numeric(sheet2[right_col])
 
-        # Keep only non-zero values and preserve original row positions
-        sheet1_filtered = sheet1[sheet1[deposit_col] != 0].reset_index()
-        sheet2_filtered = sheet2[sheet2[debit_col] != 0].reset_index()
+        # Keep non-zero rows and preserve original row refs
+        sheet1_filtered = sheet1[sheet1[left_col] != 0].reset_index()
+        sheet2_filtered = sheet2[sheet2[right_col] != 0].reset_index()
 
-        # ==========================================
-        # RECONCILIATION LOGIC
-        # ==========================================
-        deposit_count = Counter(sheet1_filtered[deposit_col])
-        debit_count = Counter(sheet2_filtered[debit_col])
+        # Reconciliation
+        left_count = Counter(sheet1_filtered[left_col])
+        right_count = Counter(sheet2_filtered[right_col])
 
-        all_amt = sorted(set(deposit_count.keys()) | set(debit_count.keys()))
-
+        all_amounts = sorted(set(left_count.keys()) | set(right_count.keys()))
         result = []
 
-        for amt in all_amt:
-            dep_count = deposit_count.get(amt, 0)
-            deb_count = debit_count.get(amt, 0)
+        for amt in all_amounts:
+            left_amt_count = left_count.get(amt, 0)
+            right_amt_count = right_count.get(amt, 0)
 
-            if dep_count != deb_count:
-                deposit_rows = sheet1_filtered[
-                    sheet1_filtered[deposit_col] == amt
-                ]["index"].tolist()
+            if left_amt_count != right_amt_count:
+                left_rows = sheet1_filtered[sheet1_filtered[left_col] == amt]["index"].tolist()
+                right_rows = sheet2_filtered[sheet2_filtered[right_col] == amt]["index"].tolist()
 
-                debit_rows = sheet2_filtered[
-                    sheet2_filtered[debit_col] == amt
-                ]["index"].tolist()
-
-                if deb_count > dep_count:
-                    missing_where = f"Missing in {deposit_col}"
-                    missing_count = deb_count - dep_count
+                if right_amt_count > left_amt_count:
+                    missing_where = f"Missing in {left_col}"
+                    missing_count = right_amt_count - left_amt_count
                 else:
-                    missing_where = f"Missing in {debit_col}"
-                    missing_count = dep_count - deb_count
+                    missing_where = f"Missing in {right_col}"
+                    missing_count = left_amt_count - right_amt_count
 
                 result.append({
                     "Amount": amt,
-                    "Deposit Count": dep_count,
-                    "Debit Count": deb_count,
+                    f"{left_label} Count": left_amt_count,
+                    f"{right_label} Count": right_amt_count,
                     "Missing Where": missing_where,
                     "Missing Count": missing_count,
-                    "Sheet1 Rows": deposit_rows,
-                    "Sheet2 Rows": debit_rows
+                    "Sheet1 Rows": left_rows,
+                    "Sheet2 Rows": right_rows
                 })
 
         result_df = pd.DataFrame(result)
 
-        # ==========================================
-        # KPI METRICS
-        # ==========================================
-        st.success("File loaded and processed successfully ✔")
-        st.subheader("📊 Dashboard")
-
-        total_deposits = len(sheet1_filtered)
-        total_debits = len(sheet2_filtered)
+        # Metrics
+        total_left = len(sheet1_filtered)
+        total_right = len(sheet2_filtered)
         mismatch_groups = len(result_df)
         total_missing_entries = int(result_df["Missing Count"].sum()) if not result_df.empty else 0
         status_text = "OK" if result_df.empty else "Check"
 
+        st.success("File loaded and processed successfully ✔")
+        st.subheader("📊 Dashboard")
+
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Deposits", total_deposits)
-        c2.metric("Debits", total_debits)
+        c1.metric(left_label, total_left)
+        c2.metric(right_label, total_right)
         c3.metric("Mismatch Groups", mismatch_groups)
         c4.metric("Total Missing Entries", total_missing_entries)
         c5.metric("Status", status_text)
 
-        # ==========================================
-        # TABS
-        # ==========================================
+        # Tabs
         tab1, tab2, tab3, tab4 = st.tabs(["Summary", "Mismatches", "Preview", "Debug"])
 
         with tab1:
             st.markdown("### Reconciliation Overview")
 
-            left, right = st.columns([1.35, 1])
+            a, b = st.columns([1.35, 1])
 
-            with left:
+            with a:
                 if not result_df.empty:
                     chart_df = result_df[["Amount", "Missing Count"]].copy()
                     chart_df["Amount"] = chart_df["Amount"].astype(str)
@@ -329,20 +378,24 @@ if uploaded_file:
                 else:
                     st.success("All amounts matched ✔")
 
-            with right:
+            with b:
                 summary_df = pd.DataFrame({
                     "Metric": [
-                        "Detected Deposit Column",
-                        "Detected Debit Column",
+                        "Comparison Type",
+                        "Detected Sheet1 Header Row",
                         "Detected Sheet2 Header Row",
+                        "Detected Sheet1 Column",
+                        "Detected Sheet2 Column",
                         "File Name",
                         "Mismatch Groups",
                         "Total Missing Entries"
                     ],
                     "Value": [
-                        deposit_col,
-                        debit_col,
-                        header_row,
+                        comparison_mode,
+                        sheet1_header,
+                        sheet2_header,
+                        left_col,
+                        right_col,
                         uploaded_file.name,
                         mismatch_groups,
                         total_missing_entries
@@ -350,28 +403,22 @@ if uploaded_file:
                 })
                 st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-            if not result_df.empty:
-                st.info(
-                    f"There are {mismatch_groups} mismatch groups across different amount values, "
-                    f"with a total of {total_missing_entries} missing/unmatched entries."
-                )
-
         with tab2:
             st.markdown("### Detailed Mismatch Report")
 
             if not result_df.empty:
-                col_a, col_b = st.columns(2)
+                col1, col2 = st.columns(2)
 
-                with col_a:
+                with col1:
                     filter_type = st.selectbox(
                         "Filter by Missing Where",
                         options=["All"] + sorted(result_df["Missing Where"].astype(str).unique().tolist())
                     )
 
-                with col_b:
+                with col2:
                     sort_by = st.selectbox(
                         "Sort by",
-                        options=["Amount", "Missing Count", "Deposit Count", "Debit Count"]
+                        options=["Amount", "Missing Count", f"{left_label} Count", f"{right_label} Count"]
                     )
 
                 filtered_result_df = result_df.copy()
@@ -385,9 +432,7 @@ if uploaded_file:
 
                 st.dataframe(filtered_result_df, use_container_width=True)
 
-                st.markdown("#### Download Report")
                 d1, d2 = st.columns(2)
-
                 with d1:
                     st.download_button(
                         "⬇ Download CSV",
@@ -403,12 +448,6 @@ if uploaded_file:
                         "reconciliation_result.xlsx",
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
-
-                st.markdown("#### Understanding Row References")
-                st.caption(
-                    "Sheet1 Rows and Sheet2 Rows show the original row positions where that amount appears "
-                    "after loading the file. This helps trace exactly where mismatches belong."
-                )
 
             else:
                 st.success("All amounts matched ✔ No mismatches found.")
@@ -428,15 +467,15 @@ if uploaded_file:
 
         with tab4:
             st.markdown("### Debug Information")
-            st.write("Detected Sheet2 header row:", header_row)
-            st.write("Detected deposit column:", deposit_col)
-            st.write("Detected debit column:", debit_col)
+            st.write("Comparison mode:", comparison_mode)
+            st.write("Detected Sheet1 header row:", sheet1_header)
+            st.write("Detected Sheet2 header row:", sheet2_header)
+            st.write("Detected Sheet1 column:", left_col)
+            st.write("Detected Sheet2 column:", right_col)
             st.write("Sheet1 columns:", list(sheet1.columns))
             st.write("Sheet2 columns:", list(sheet2.columns))
 
-        # ==========================================
-        # FOOTER
-        # ==========================================
+        # Footer
         st.markdown("""
         <div class="footer-box">
             🚀 Built by <b>Aniruddha Pathak</b> • Smart Reconciliation Tool

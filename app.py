@@ -7,7 +7,7 @@ from io import BytesIO
 # PAGE CONFIG
 # ==========================================
 st.set_page_config(
-    page_title="Bank Reconciliation Tool",
+    page_title="Smart Bank Reconciliation Tool",
     page_icon="💰",
     layout="wide"
 )
@@ -128,7 +128,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("## ✅ Smart Features")
     st.write("- Auto header detection")
-    st.write("- Flexible column matching")
+    st.write("- Strict column matching")
     st.write("- Row-level mismatch tracing")
     st.write("- CSV and Excel export")
 
@@ -152,36 +152,46 @@ def normalize_name(name):
     )
 
 def find_matching_column(columns, aliases):
+    """
+    Strict matching:
+    1. exact normalized match
+    2. startswith normalized match
+    Avoid loose reverse matches like 'INR' matching 'Withdrawal Amt (INR)'
+    """
     normalized_map = {normalize_name(col): col for col in columns}
+
     for alias in aliases:
         alias_norm = normalize_name(alias)
         if alias_norm in normalized_map:
             return normalized_map[alias_norm]
 
-    # fallback: partial match
     for col in columns:
         col_norm = normalize_name(col)
         for alias in aliases:
             alias_norm = normalize_name(alias)
-            if alias_norm in col_norm or col_norm in alias_norm:
+            if col_norm.startswith(alias_norm):
                 return col
+
     return None
 
-def read_sheet_with_header_detection(file_bytes, sheet_name, aliases_to_find, max_header_rows=12):
+def read_sheet_with_header_detection(file_bytes, sheet_name, alias_groups, max_header_rows=25):
+    """
+    Try multiple header rows and return the first valid one.
+    """
     for header_row in range(max_header_rows):
         try:
             temp_df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=header_row)
             temp_df = clean_columns(temp_df)
 
-            found_any = False
-            for alias_group in aliases_to_find:
-                match = find_matching_column(temp_df.columns, alias_group)
+            found_columns = []
+            for aliases in alias_groups:
+                match = find_matching_column(temp_df.columns, aliases)
                 if match is not None:
-                    found_any = True
-                    break
+                    found_columns.append(match)
 
-            if found_any:
+            if found_columns:
                 return temp_df, header_row
+
         except Exception:
             continue
 
@@ -255,18 +265,19 @@ if uploaded_file:
     try:
         file_bytes = uploaded_file.read()
 
-        # Read both sheets with flexible header detection
+        # Read Sheet1
         sheet1, sheet1_header = read_sheet_with_header_detection(
             file_bytes=file_bytes,
             sheet_name="Sheet1",
-            aliases_to_find=[DEPOSIT_ALIASES, WITHDRAWAL_ALIASES],
+            alias_groups=[DEPOSIT_ALIASES, WITHDRAWAL_ALIASES],
             max_header_rows=25
         )
 
+        # Read Sheet2
         sheet2, sheet2_header = read_sheet_with_header_detection(
             file_bytes=file_bytes,
             sheet_name="Sheet2",
-            aliases_to_find=[DEBIT_ALIASES, CREDIT_ALIASES],
+            alias_groups=[DEBIT_ALIASES, CREDIT_ALIASES],
             max_header_rows=12
         )
 
@@ -278,7 +289,7 @@ if uploaded_file:
             st.error("❌ Could not detect the correct header row in Sheet2.")
             st.stop()
 
-        # Choose columns by mode
+        # Choose columns based on mode
         if comparison_mode == "Deposit vs Debit":
             left_label = "Deposit"
             right_label = "Debit"
@@ -307,13 +318,17 @@ if uploaded_file:
         sheet1[left_col] = clean_numeric(sheet1[left_col])
         sheet2[right_col] = clean_numeric(sheet2[right_col])
 
-        # Keep non-zero rows and preserve original row refs
+        # Keep non-zero rows and preserve original row references
         sheet1_filtered = sheet1[sheet1[left_col] != 0].reset_index()
         sheet2_filtered = sheet2[sheet2[right_col] != 0].reset_index()
 
+        # Round to 2 decimals for stable comparison
+        sheet1_filtered["_match_amount"] = sheet1_filtered[left_col].round(2)
+        sheet2_filtered["_match_amount"] = sheet2_filtered[right_col].round(2)
+
         # Reconciliation
-        left_count = Counter(sheet1_filtered[left_col])
-        right_count = Counter(sheet2_filtered[right_col])
+        left_count = Counter(sheet1_filtered["_match_amount"])
+        right_count = Counter(sheet2_filtered["_match_amount"])
 
         all_amounts = sorted(set(left_count.keys()) | set(right_count.keys()))
         result = []
@@ -323,8 +338,13 @@ if uploaded_file:
             right_amt_count = right_count.get(amt, 0)
 
             if left_amt_count != right_amt_count:
-                left_rows = sheet1_filtered[sheet1_filtered[left_col] == amt]["index"].tolist()
-                right_rows = sheet2_filtered[sheet2_filtered[right_col] == amt]["index"].tolist()
+                left_rows = sheet1_filtered[
+                    sheet1_filtered["_match_amount"] == amt
+                ]["index"].tolist()
+
+                right_rows = sheet2_filtered[
+                    sheet2_filtered["_match_amount"] == amt
+                ]["index"].tolist()
 
                 if right_amt_count > left_amt_count:
                     missing_where = f"Missing in {left_col}"
@@ -433,6 +453,7 @@ if uploaded_file:
                 st.dataframe(filtered_result_df, use_container_width=True)
 
                 d1, d2 = st.columns(2)
+
                 with d1:
                     st.download_button(
                         "⬇ Download CSV",

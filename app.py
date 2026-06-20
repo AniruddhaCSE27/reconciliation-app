@@ -3,18 +3,12 @@ import pandas as pd
 from io import BytesIO
 from collections import Counter
 
-# =====================================================
-# PAGE CONFIG
-# =====================================================
 st.set_page_config(
     page_title="Smart Bank Reconciliation Tool",
     page_icon="💰",
     layout="wide"
 )
 
-# =====================================================
-# CSS
-# =====================================================
 st.markdown("""
 <style>
 .block-container {
@@ -47,9 +41,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# =====================================================
-# HEADER
-# =====================================================
 st.markdown("""
 <div class="hero-card">
     <div class="hero-title">💰 Smart Bank Reconciliation Tool</div>
@@ -60,9 +51,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# =====================================================
-# SIDEBAR
-# =====================================================
 with st.sidebar:
     st.markdown("## ⚙️ How to Use")
     st.write("1. Upload Excel file")
@@ -77,11 +65,10 @@ with st.sidebar:
     st.write("- Withdrawal vs Credit")
     st.write("- Auto header detection")
     st.write("- Row-level mismatch report")
-    st.write("- Amount summary report")
+    st.write("- Amount-wise audit summary")
+    st.write("- Missing location report")
 
-# =====================================================
-# HELPERS
-# =====================================================
+
 def normalize_name(name):
     return (
         str(name)
@@ -135,6 +122,7 @@ def detect_header(file_bytes, sheet_name, alias_groups, max_rows=70):
                 sheet_name=sheet_name,
                 header=header_row
             )
+
             df = clean_columns(df)
 
             score = 0
@@ -171,6 +159,7 @@ def clean_numeric(series):
 
 def prepare_transaction_df(df, amount_col, header_row, source_name):
     temp = df.copy()
+
     temp[amount_col] = clean_numeric(temp[amount_col])
     temp = temp[temp[amount_col] != 0].copy()
 
@@ -186,41 +175,43 @@ def build_row_level_report(bank_df, erp_df, bank_label, erp_label):
     erp_pool = {}
 
     for _, row in bank_df.iterrows():
-        amt = row["Amount"]
-        bank_pool.setdefault(amt, []).append(row)
+        amount = row["Amount"]
+        bank_pool.setdefault(amount, []).append(row)
 
     for _, row in erp_df.iterrows():
-        amt = row["Amount"]
-        erp_pool.setdefault(amt, []).append(row)
+        amount = row["Amount"]
+        erp_pool.setdefault(amount, []).append(row)
 
     all_amounts = sorted(set(bank_pool.keys()) | set(erp_pool.keys()))
     unmatched_rows = []
 
-    for amt in all_amounts:
-        bank_rows = bank_pool.get(amt, [])
-        erp_rows = erp_pool.get(amt, [])
+    for amount in all_amounts:
+        bank_rows = bank_pool.get(amount, [])
+        erp_rows = erp_pool.get(amount, [])
 
-        min_match = min(len(bank_rows), len(erp_rows))
+        matched_count = min(len(bank_rows), len(erp_rows))
 
-        extra_bank = bank_rows[min_match:]
-        extra_erp = erp_rows[min_match:]
+        extra_bank = bank_rows[matched_count:]
+        extra_erp = erp_rows[matched_count:]
 
         for row in extra_bank:
             unmatched_rows.append({
-                "Status": f"Missing in {erp_label}",
-                "Amount": amt,
+                "Amount": amount,
+                "Missing Location": f"Missing in {erp_label}",
+                "Status": f"Extra in {bank_label}",
                 "Source": bank_label,
                 "Excel Row No": row["Excel Row No"],
-                "Remarks": f"{bank_label} transaction exists, but matching {erp_label} transaction not found."
+                "Remarks": f"{bank_label} transaction exists, but matching {erp_label} transaction was not found."
             })
 
         for row in extra_erp:
             unmatched_rows.append({
-                "Status": f"Missing in {bank_label}",
-                "Amount": amt,
+                "Amount": amount,
+                "Missing Location": f"Missing in {bank_label}",
+                "Status": f"Extra in {erp_label}",
                 "Source": erp_label,
                 "Excel Row No": row["Excel Row No"],
-                "Remarks": f"{erp_label} transaction exists, but matching {bank_label} transaction not found."
+                "Remarks": f"{erp_label} transaction exists, but matching {bank_label} transaction was not found."
             })
 
     return pd.DataFrame(unmatched_rows)
@@ -233,24 +224,37 @@ def build_amount_summary(bank_df, erp_df, bank_label, erp_label):
     rows = []
     all_amounts = sorted(set(bank_count.keys()) | set(erp_count.keys()))
 
-    for amt in all_amounts:
-        b_count = bank_count.get(amt, 0)
-        e_count = erp_count.get(amt, 0)
+    for amount in all_amounts:
+        bank_amount_count = bank_count.get(amount, 0)
+        erp_amount_count = erp_count.get(amount, 0)
 
-        if b_count != e_count:
+        if bank_amount_count != erp_amount_count:
             rows.append({
-                "Amount": amt,
-                f"{bank_label} Count": b_count,
-                f"{erp_label} Count": e_count,
-                "Difference": abs(b_count - e_count),
+                "Amount": amount,
+                f"{bank_label} Count": bank_amount_count,
+                f"{erp_label} Count": erp_amount_count,
+                "Difference": abs(bank_amount_count - erp_amount_count),
+                "Missing Location": (
+                    f"Missing in {erp_label}"
+                    if bank_amount_count > erp_amount_count
+                    else f"Missing in {bank_label}"
+                ),
                 "Status": (
                     f"Extra in {bank_label}"
-                    if b_count > e_count
+                    if bank_amount_count > erp_amount_count
                     else f"Extra in {erp_label}"
                 )
             })
 
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+
+    if not result.empty:
+        result = result.sort_values(
+            by="Difference",
+            ascending=False
+        ).reset_index(drop=True)
+
+    return result
 
 
 def export_excel(row_report, summary_report):
@@ -263,32 +267,52 @@ def export_excel(row_report, summary_report):
     output.seek(0)
     return output.getvalue()
 
-# =====================================================
-# ALIASES
-# =====================================================
+
 DEPOSIT_ALIASES = [
-    "Deposit Amt (INR)", "Deposit Amount", "Deposit Amt",
-    "Deposit", "Deposits", "Credit", "Credit Amount", "Cr Amount"
+    "Deposit Amt (INR)",
+    "Deposit Amount",
+    "Deposit Amt",
+    "Deposit",
+    "Deposits",
+    "Credit",
+    "Credit Amount",
+    "Cr Amount"
 ]
 
 WITHDRAWAL_ALIASES = [
-    "Withdrawal Amt (INR)", "Withdrawal Amount", "Withdrawal Amt",
-    "Withdrawal", "Withdrawals", "Debit", "Debit Amount", "Dr Amount"
+    "Withdrawal Amt (INR)",
+    "Withdrawal Amount",
+    "Withdrawal Amt",
+    "Withdrawal",
+    "Withdrawals",
+    "Debit",
+    "Debit Amount",
+    "Dr Amount"
 ]
 
 DEBIT_ALIASES = [
-    "Debit (LC)", "Debit LC", "Debit", "Debit Amount",
-    "Dr", "Dr Amount", "Payment", "Paid Amount"
+    "Debit (LC)",
+    "Debit LC",
+    "Debit",
+    "Debit Amount",
+    "Dr",
+    "Dr Amount",
+    "Payment",
+    "Paid Amount"
 ]
 
 CREDIT_ALIASES = [
-    "Credit (LC)", "Credit LC", "Credit", "Credit Amount",
-    "Cr", "Cr Amount", "Receipt", "Received Amount"
+    "Credit (LC)",
+    "Credit LC",
+    "Credit",
+    "Credit Amount",
+    "Cr",
+    "Cr Amount",
+    "Receipt",
+    "Received Amount"
 ]
 
-# =====================================================
-# APP
-# =====================================================
+
 uploaded_file = st.file_uploader("📤 Upload Excel File", type=["xlsx"])
 
 comparison_mode = st.selectbox(
@@ -299,6 +323,7 @@ comparison_mode = st.selectbox(
 if uploaded_file:
     try:
         file_bytes = uploaded_file.read()
+
         excel_file = pd.ExcelFile(BytesIO(file_bytes))
         sheet_names = excel_file.sheet_names
 
@@ -307,7 +332,11 @@ if uploaded_file:
         col1, col2 = st.columns(2)
 
         with col1:
-            bank_sheet = st.selectbox("Select Bank Statement Sheet", sheet_names, index=0)
+            bank_sheet = st.selectbox(
+                "Select Bank Statement Sheet",
+                sheet_names,
+                index=0
+            )
 
         with col2:
             erp_sheet = st.selectbox(
@@ -319,7 +348,7 @@ if uploaded_file:
         if bank_sheet == erp_sheet:
             st.warning(
                 "⚠️ Bank sheet and ERP sheet are the same. "
-                "For real reconciliation, select two different sheets or upload a file containing both bank and ERP data."
+                "For correct reconciliation, select two different sheets."
             )
 
         if comparison_mode == "Deposit vs Debit":
@@ -399,14 +428,17 @@ if uploaded_file:
         total_bank = len(bank_txn)
         total_erp = len(erp_txn)
         total_unmatched = len(row_report)
-        matched = max(total_bank, total_erp) - total_unmatched
-        match_percent = round((matched / max(total_bank, total_erp)) * 100, 2) if max(total_bank, total_erp) else 0
+        max_total = max(total_bank, total_erp)
+
+        matched_count = max_total - total_unmatched
+        match_percent = round((matched_count / max_total) * 100, 2) if max_total else 0
 
         st.success("✅ File processed successfully")
 
         st.subheader("📊 Reconciliation Dashboard")
 
         m1, m2, m3, m4, m5 = st.columns(5)
+
         m1.metric(bank_label, total_bank)
         m2.metric(erp_label, total_erp)
         m3.metric("Unmatched Rows", total_unmatched)
@@ -422,21 +454,21 @@ if uploaded_file:
         ])
 
         with tab1:
-            st.markdown("### ✅ Client-Friendly Row-Level Unmatched Report")
+            st.markdown("### Client-Friendly Row-Level Unmatched Report")
 
             if row_report.empty:
                 st.success("🎉 All transactions matched successfully.")
             else:
                 status_filter = st.selectbox(
-                    "Filter Status",
-                    ["All"] + sorted(row_report["Status"].unique().tolist())
+                    "Filter Missing Location",
+                    ["All"] + sorted(row_report["Missing Location"].unique().tolist())
                 )
 
                 filtered_row_report = row_report.copy()
 
                 if status_filter != "All":
                     filtered_row_report = filtered_row_report[
-                        filtered_row_report["Status"] == status_filter
+                        filtered_row_report["Missing Location"] == status_filter
                     ]
 
                 st.dataframe(
@@ -474,14 +506,22 @@ if uploaded_file:
         with tab3:
             st.markdown("### Bank Statement Preview")
             st.write("Detected Bank Header Row:", bank_header + 1)
-            st.write("Detected Amount Column:", bank_amount_col)
-            st.dataframe(bank_txn.head(100), use_container_width=True)
+            st.write("Detected Bank Amount Column:", bank_amount_col)
+            st.dataframe(
+                bank_txn.head(100),
+                use_container_width=True,
+                hide_index=True
+            )
 
         with tab4:
             st.markdown("### ERP / Book Preview")
             st.write("Detected ERP Header Row:", erp_header + 1)
-            st.write("Detected Amount Column:", erp_amount_col)
-            st.dataframe(erp_txn.head(100), use_container_width=True)
+            st.write("Detected ERP Amount Column:", erp_amount_col)
+            st.dataframe(
+                erp_txn.head(100),
+                use_container_width=True,
+                hide_index=True
+            )
 
         with tab5:
             st.markdown("### Debug Information")
@@ -490,6 +530,10 @@ if uploaded_file:
             st.write("Selected Bank Sheet:", bank_sheet)
             st.write("Selected ERP Sheet:", erp_sheet)
             st.write("Comparison Mode:", comparison_mode)
+            st.write("Bank Header Row:", bank_header + 1)
+            st.write("ERP Header Row:", erp_header + 1)
+            st.write("Bank Amount Column:", bank_amount_col)
+            st.write("ERP Amount Column:", erp_amount_col)
             st.write("Bank Columns:", list(bank_df_raw.columns))
             st.write("ERP Columns:", list(erp_df_raw.columns))
 
